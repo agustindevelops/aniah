@@ -1,3 +1,4 @@
+import { createReadStream } from "node:fs";
 import Fastify from "fastify";
 import cors from "@fastify/cors";
 import { Db } from "@local-sync/db";
@@ -14,8 +15,8 @@ app.get("/health", async () => ({ ok: true }));
 app.post("/sync", async (_request, reply) => {
   try {
     const response = await fetch(`${workerUrl}/sync/gmail`, { method: "POST" });
-    const payload = await response.json();
-    return reply.send(payload);
+    const payload = (await response.json()) as Record<string, unknown>;
+    return reply.status(response.status).send(payload);
   } catch {
     return reply.status(500).send({ ok: false, message: "Failed to trigger sync worker." });
   }
@@ -56,6 +57,26 @@ app.get("/records/:id/images", async (request) => {
   const images = db.getImagesForNormalizedRecord(normalizedId);
   db.close();
   return { ok: true, images };
+});
+
+app.get("/records/:id/images/:imageId/file", async (request, reply) => {
+  const params = request.params as { id: string; imageId: string };
+  const normalizedId = Number(params.id);
+  const recordImageId = Number(params.imageId);
+  if (!Number.isFinite(normalizedId) || !Number.isFinite(recordImageId)) {
+    return reply.status(400).send({ ok: false, message: "Invalid id." });
+  }
+  const db = new Db();
+  try {
+    const file = db.getRecordImageFileForDownload(normalizedId, recordImageId);
+    if (!file) {
+      return reply.status(404).send({ ok: false, message: "Image not found." });
+    }
+    reply.header("Cache-Control", "private, max-age=3600");
+    return reply.type(file.mimeType).send(createReadStream(file.absolutePath));
+  } finally {
+    db.close();
+  }
 });
 
 app.delete("/records", async (request, reply) => {

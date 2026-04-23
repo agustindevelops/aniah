@@ -3,6 +3,7 @@ import { createHash } from "node:crypto";
 import { mkdir, writeFile } from "node:fs/promises";
 import { basename, extname, resolve } from "node:path";
 import type { GmailCapturedImage, GmailCapturedRecord } from "@local-sync/shared";
+import { resolveImageStorageDir } from "@local-sync/shared";
 
 interface CaptureOptions {
   cdpUrl?: string;
@@ -58,7 +59,7 @@ function contentTypeToExt(contentType: string | null): string {
 }
 
 function imageStorageRoot(): string {
-  return process.env.IMAGE_STORAGE_DIR ?? resolve(process.cwd(), "data", "images");
+  return resolveImageStorageDir();
 }
 
 async function saveImageBuffer(
@@ -127,6 +128,166 @@ async function openGmailPage(context: BrowserContext): Promise<Page> {
   return page;
 }
 
+/** Gmail thread / conversation view back control (label varies by folder / locale). */
+const EMAIL_IN_ANGLE = /<([\w.+-]+@[\w.-]+\.[A-Za-z]{2,})>/;
+const EMAIL_LOOSE = /\b[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}\b/;
+
+function normalizeMailtoHref(href: string): string | null {
+  const raw = href.replace(/^mailto:/i, "").split("?")[0].trim();
+  if (!raw.includes("@")) return null;
+  try {
+    return decodeURIComponent(raw);
+  } catch {
+    return raw;
+  }
+}
+
+/**
+ * Best-effort sender address from the opened thread (first message), for inbox and sent.
+ */
+async function extractSenderEmailFromOpenMessage(page: Page): Promise<string | null> {
+  const firstCard = page.locator("div.adn, div.gs").first();
+
+  const fromSpan = firstCard.locator("span.gD[email], span[email]").first();
+  const attr = await fromSpan.getAttribute("email").catch(() => null);
+  if (attr?.includes("@")) {
+    return attr.trim();
+  }
+
+  const mailto = firstCard.locator('a[href^="mailto:"]').first();
+  const href = await mailto.getAttribute("href").catch(() => null);
+  if (href) {
+    const parsed = normalizeMailtoHref(href);
+    if (parsed) return parsed;
+  }
+
+  const pageMailto = page.locator('div.adn a[href^="mailto:"], .h7 a[href^="mailto:"]').first();
+  const href2 = await pageMailto.getAttribute("href").catch(() => null);
+  if (href2) {
+    const parsed = normalizeMailtoHref(href2);
+    if (parsed) return parsed;
+  }
+
+  const globalEmailSpan = page.locator("span[email]").first();
+  const g = await globalEmailSpan.getAttribute("email").catch(() => null);
+  if (g?.includes("@")) return g.trim();
+
+  const title = await firstCard.locator(".gD").first().getAttribute("title").catch(() => null);
+  if (title) {
+    const m = title.match(EMAIL_LOOSE);
+    if (m) return m[0];
+  }
+
+  const gDText = await firstCard.locator(".gD").first().innerText().catch(() => "");
+  const angle = gDText.match(EMAIL_IN_ANGLE);
+  if (angle) return angle[1].trim();
+  const loose = gDText.match(EMAIL_LOOSE);
+  if (loose) return loose[0].trim();
+
+  return null;
+}
+
+async function goBackToList(page: Page): Promise<void> {
+  const back = page.locator(
+    [
+      'div[aria-label="Back to Inbox"]',
+      'div[aria-label="Back to Sent Mail"]',
+      'div[aria-label^="Back to "]',
+    ].join(", "),
+  );
+  if ((await back.count()) > 0) {
+    await back.first().click();
+  } else {
+    await page.goBack().catch(() => undefined);
+  }
+  await page.waitForTimeout(1000);
+}
+
+/**
+ * Same list → open → capture → back flow as inbox: reads visible `tr.zA` rows for the current search.
+ */
+async function captureRecordsFromCurrentSearch(
+  page: Page,
+  maxTake: number,
+  seenThreadIds: Set<string>,
+  listIndexOffset: number,
+): Promise<GmailCapturedRecord[]> {
+  const rows = page.locator("tr.zA:visible");
+  const timeoutAt = Date.now() + 20000;
+  let rowCount = await rows.count();
+  while (rowCount === 0 && Date.now() < timeoutAt) {
+    await page.waitForTimeout(350);
+    rowCount = await rows.count();
+  }
+  if (rowCount === 0) {
+    return [];
+  }
+
+  const count = Math.min(rowCount, maxTake);
+  const records: GmailCapturedRecord[] = [];
+
+  for (let i = 0; i < count; i += 1) {
+    const row = rows.nth(i);
+    await row.scrollIntoViewIfNeeded().catch(() => undefined);
+    const subject = ((await row.locator(".bog").first().textContent()) ?? "").trim();
+    const from = ((await row.locator(".yW span").first().textContent()) ?? "").trim();
+    const snippet = ((await row.locator(".y2").first().textContent()) ?? "").replace(/^-/, "").trim();
+    const receivedTitle = ((await row.locator("td.xW span").first().getAttribute("title")) ?? "").trim();
+    const receivedAt = toIso(receivedTitle);
+
+    const subjectCell = row.locator(".bog").first();
+    const senderCell = row.locator(".yW span").first();
+    const subjectVisible = await subjectCell.isVisible().catch(() => false);
+    if (subjectVisible) {
+      await subjectCell.click({ timeout: 10000 });
+    } else {
+      const senderVisible = await senderCell.isVisible().catch(() => false);
+      if (senderVisible) {
+        await senderCell.click({ timeout: 10000 });
+      } else {
+        await row.click({ timeout: 10000 });
+      }
+    }
+    await page.waitForTimeout(1200);
+
+    const url = page.url();
+    const threadId = url.split("/").pop() ?? `${Date.now()}-${listIndexOffset + i}`;
+
+    if (seenThreadIds.has(threadId)) {
+      await goBackToList(page);
+      continue;
+    }
+
+    const fromEmail = await extractSenderEmailFromOpenMessage(page);
+
+    const bodyText = ((await page.locator("div.a3s").first().innerText().catch(() => "")) ?? "").trim();
+    const inlineImages = await captureInlineImages(page, threadId);
+    const attachmentImages = await captureAttachmentImages(page, threadId);
+    const images = [...inlineImages, ...attachmentImages];
+
+    seenThreadIds.add(threadId);
+    records.push({
+      source: "gmail",
+      sourceRecordId: threadId,
+      threadId,
+      subject,
+      from,
+      fromEmail: fromEmail ?? null,
+      receivedAt,
+      snippet,
+      bodyText,
+      url,
+      images,
+    });
+
+    await goBackToList(page);
+  }
+
+  return records;
+}
+
+const GMAIL_FOLDER_SEARCHES = ["in:inbox", "in:sent"] as const;
+
 export async function captureGmailSinceToday(options: CaptureOptions = {}): Promise<GmailCapturedRecord[]> {
   const cdpUrl = options.cdpUrl ?? process.env.CHROME_CDP_URL ?? "http://127.0.0.1:9222";
   const maxEmails = options.maxEmails ?? Number(process.env.GMAIL_MAX_EMAILS ?? 200);
@@ -145,81 +306,41 @@ export async function captureGmailSinceToday(options: CaptureOptions = {}): Prom
     await page.waitForSelector('input[name="q"]', { timeout: 20000 });
 
     const queryDate = buildQueryDateFromCursor(sinceIso);
-    await page.fill('input[name="q"]', `in:anywhere after:${queryDate}`);
-    await page.keyboard.press("Enter");
-    await page.waitForTimeout(2000);
+    const seenThreadIds = new Set<string>();
+    const allRecords: GmailCapturedRecord[] = [];
+    let sawAnyListRows = false;
+    let indexOffset = 0;
 
-    const rows = page.locator("tr.zA:visible");
-    const timeoutAt = Date.now() + 20000;
-    let rowCount = await rows.count();
-    while (rowCount === 0 && Date.now() < timeoutAt) {
-      await page.waitForTimeout(350);
-      rowCount = await rows.count();
-    }
-
-    if (rowCount === 0) {
-      throw new Error(`No Gmail message rows found for query: in:anywhere after:${queryDate}`);
-    }
-
-    const count = Math.min(await rows.count(), maxEmails);
-    const records: GmailCapturedRecord[] = [];
-
-    for (let i = 0; i < count; i += 1) {
-      const row = rows.nth(i);
-      await row.scrollIntoViewIfNeeded().catch(() => undefined);
-      const subject = ((await row.locator(".bog").first().textContent()) ?? "").trim();
-      const from = ((await row.locator(".yW span").first().textContent()) ?? "").trim();
-      const snippet = ((await row.locator(".y2").first().textContent()) ?? "").replace(/^-/, "").trim();
-      const receivedTitle = ((await row.locator("td.xW span").first().getAttribute("title")) ?? "").trim();
-      const receivedAt = toIso(receivedTitle);
-
-      // Gmail rows are sometimes present in the DOM but not click-targetable.
-      // Prefer clicking visible subject/sender cells, then fallback to row click.
-      const subjectCell = row.locator(".bog").first();
-      const senderCell = row.locator(".yW span").first();
-      const subjectVisible = await subjectCell.isVisible().catch(() => false);
-      if (subjectVisible) {
-        await subjectCell.click({ timeout: 10000 });
-      } else {
-        const senderVisible = await senderCell.isVisible().catch(() => false);
-        if (senderVisible) {
-          await senderCell.click({ timeout: 10000 });
-        } else {
-          await row.click({ timeout: 10000 });
-        }
+    for (const folderQuery of GMAIL_FOLDER_SEARCHES) {
+      const remaining = maxEmails - allRecords.length;
+      if (remaining <= 0) {
+        break;
       }
-      await page.waitForTimeout(1200);
 
-      const url = page.url();
-      const threadId = url.split("/").pop() ?? `${Date.now()}-${i}`;
-      const bodyText = ((await page.locator("div.a3s").first().innerText().catch(() => "")) ?? "").trim();
-      const inlineImages = await captureInlineImages(page, threadId);
-      const attachmentImages = await captureAttachmentImages(page, threadId);
-      const images = [...inlineImages, ...attachmentImages];
+      await page.fill('input[name="q"]', `${folderQuery} after:${queryDate}`);
+      await page.keyboard.press("Enter");
+      await page.waitForTimeout(2000);
 
-      records.push({
-        source: "gmail",
-        sourceRecordId: threadId,
-        threadId,
-        subject,
-        from,
-        receivedAt,
-        snippet,
-        bodyText,
-        url,
-        images,
-      });
-
-      const backButton = page.locator('div[aria-label="Back to Inbox"]');
-      if ((await backButton.count()) > 0) {
-        await backButton.first().click();
-      } else {
-        await page.goBack().catch(() => undefined);
+      const rowCountBefore = await page.locator("tr.zA:visible").count();
+      if (rowCountBefore > 0) {
+        sawAnyListRows = true;
       }
-      await page.waitForTimeout(1000);
+
+      const batch = await captureRecordsFromCurrentSearch(page, remaining, seenThreadIds, indexOffset);
+      indexOffset += batch.length;
+      if (batch.length > 0) {
+        sawAnyListRows = true;
+      }
+      allRecords.push(...batch);
     }
 
-    return records;
+    if (allRecords.length === 0 && !sawAnyListRows) {
+      throw new Error(
+        `No Gmail message rows found for inbox/sent after:${queryDate} (tried ${GMAIL_FOLDER_SEARCHES.join(", ")})`,
+      );
+    }
+
+    return allRecords;
   } finally {
     await browser.close();
   }

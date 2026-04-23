@@ -1,3 +1,5 @@
+export * from "./paths.js";
+
 export type SourceName = "gmail";
 
 export interface RawRecord {
@@ -15,6 +17,8 @@ export interface NormalizedRecord {
   rawRecordId: number;
   source: SourceName;
   sourceRecordId: string;
+  /** Gmail "from" / display sender line */
+  sender: string | null;
   eventDate: string | null;
   location: string | null;
   pointOfContact: string | null;
@@ -49,6 +53,8 @@ export interface GmailCapturedRecord {
   threadId: string;
   subject: string;
   from: string;
+  /** Parsed from open message (mailto / span[email], etc.); may be absent in some UI skins */
+  fromEmail?: string | null;
   receivedAt: string;
   snippet: string;
   bodyText: string;

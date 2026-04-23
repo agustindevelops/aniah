@@ -1,20 +1,16 @@
 import Database from "better-sqlite3";
 import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, rmSync } from "node:fs";
-import { dirname, isAbsolute, resolve } from "node:path";
-import { fileURLToPath } from "node:url";
+import { dirname, resolve } from "node:path";
 import type { AiSummary, NormalizedRecord, RawRecord, SyncSourceState } from "@local-sync/shared";
+import {
+  REPO_ROOT,
+  isPathUnderRoot,
+  resolveDefaultSqlitePath,
+  resolveImageStorageDir,
+} from "@local-sync/shared";
 
-const REPO_ROOT = resolve(fileURLToPath(new URL("../../../", import.meta.url)));
-const DEFAULT_DB_PATH = process.env.SQLITE_DB_PATH ?? resolve(REPO_ROOT, "data", "local-sync.db");
-
-function resolveImageStorageDir(): string {
-  const fromEnv = process.env.IMAGE_STORAGE_DIR;
-  if (fromEnv) {
-    return isAbsolute(fromEnv) ? fromEnv : resolve(REPO_ROOT, fromEnv);
-  }
-  return resolve(REPO_ROOT, "data", "images");
-}
+const DEFAULT_DB_PATH = resolveDefaultSqlitePath();
 
 export class Db {
   private readonly db: Database.Database;
@@ -52,6 +48,7 @@ export class Db {
         raw_record_id INTEGER NOT NULL UNIQUE,
         source TEXT NOT NULL,
         source_record_id TEXT NOT NULL,
+        sender TEXT,
         event_date TEXT,
         location TEXT,
         point_of_contact TEXT,
@@ -100,6 +97,14 @@ export class Db {
       CREATE INDEX IF NOT EXISTS idx_normalized_records_updated_at ON normalized_records(updated_at);
       CREATE INDEX IF NOT EXISTS idx_record_images_raw_record_id ON record_images(raw_record_id);
     `);
+    this.ensureNormalizedSenderColumn();
+  }
+
+  private ensureNormalizedSenderColumn(): void {
+    const cols = this.db.prepare("PRAGMA table_info(normalized_records)").all() as { name: string }[];
+    if (!cols.some((c) => c.name === "sender")) {
+      this.db.exec("ALTER TABLE normalized_records ADD COLUMN sender TEXT");
+    }
   }
 
   upsertSourceState(state: SyncSourceState): void {
@@ -154,10 +159,10 @@ export class Db {
       .prepare(
         `
       INSERT OR REPLACE INTO normalized_records(
-        raw_record_id, source, source_record_id, event_date, location, point_of_contact,
+        raw_record_id, source, source_record_id, sender, event_date, location, point_of_contact,
         assigned_staff, status, notes, updated_at, raw_text
       ) VALUES (
-        @rawRecordId, @source, @sourceRecordId, @eventDate, @location, @pointOfContact,
+        @rawRecordId, @source, @sourceRecordId, @sender, @eventDate, @location, @pointOfContact,
         @assignedStaff, @status, @notes, @updatedAt, @rawText
       )
     `,
@@ -239,6 +244,7 @@ export class Db {
         nr.id,
         nr.source,
         nr.source_record_id as sourceRecordId,
+        nr.sender as sender,
         nr.event_date as eventDate,
         nr.location,
         nr.point_of_contact as pointOfContact,
@@ -306,6 +312,39 @@ export class Db {
   }
 
   /**
+   * Resolves a stored image file for download if it belongs to the normalized record
+   * and lives under the configured image storage directory.
+   */
+  getRecordImageFileForDownload(
+    normalizedRecordId: number,
+    recordImageId: number,
+  ): { absolutePath: string; mimeType: string } | null {
+    const row = this.db
+      .prepare(
+        `
+      SELECT ri.local_path as localPath, ri.mime_type as mimeType
+      FROM normalized_records nr
+      JOIN record_images ri ON ri.raw_record_id = nr.raw_record_id
+      WHERE nr.id = ? AND ri.id = ?
+    `,
+      )
+      .get(normalizedRecordId, recordImageId) as { localPath: string; mimeType: string } | undefined;
+    if (!row) return null;
+    const absFile = resolve(row.localPath);
+    if (!existsSync(absFile)) return null;
+    const configuredDir = resolve(resolveImageStorageDir());
+    const underImageDir = isPathUnderRoot(configuredDir, absFile);
+    const underRepo = isPathUnderRoot(REPO_ROOT, absFile);
+    if (!underImageDir && !underRepo) {
+      return null;
+    }
+    return {
+      absolutePath: absFile,
+      mimeType: row.mimeType?.trim() ? row.mimeType : "application/octet-stream",
+    };
+  }
+
+  /**
    * Deletes all app data for local testing. Optionally removes local image files.
    * Does not remove the SQLite file itself (tables are emptied).
    */
@@ -318,6 +357,10 @@ export class Db {
     this.db.exec("DELETE FROM normalized_records");
     this.db.exec("DELETE FROM raw_records");
     this.db.exec("DELETE FROM sync_sources");
+    this.db.exec(
+      `INSERT INTO sync_sources(name, last_synced_at, last_cursor, last_hash)
+       VALUES ('gmail', NULL, NULL, NULL)`,
+    );
     this.db.exec("COMMIT");
     this.db.exec("VACUUM");
 

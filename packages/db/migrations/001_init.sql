@@ -22,6 +22,7 @@ CREATE TABLE IF NOT EXISTS normalized_records (
   raw_record_id INTEGER NOT NULL UNIQUE,
   source TEXT NOT NULL,
   source_record_id TEXT NOT NULL,
+  sender TEXT,
   event_date TEXT,
   location TEXT,
   point_of_contact TEXT,
