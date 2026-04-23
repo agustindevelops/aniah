@@ -1,0 +1,23 @@
+{
+  "name": "@local-sync/worker",
+  "version": "0.1.0",
+  "type": "module",
+  "main": "src/server.ts",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "dev": "tsx watch src/server.ts",
+    "start": "tsx src/server.ts",
+    "typecheck": "tsc -p tsconfig.json --noEmit"
+  },
+  "dependencies": {
+    "@local-sync/ai": "0.1.0",
+    "@local-sync/db": "0.1.0",
+    "@local-sync/pipeline": "0.1.0",
+    "@local-sync/scraper": "0.1.0",
+    "@local-sync/shared": "0.1.0",
+    "fastify": "^5.3.3"
+  },
+  "devDependencies": {
+    "tsx": "^4.19.4"
+  }
+}

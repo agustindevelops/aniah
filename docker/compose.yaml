@@ -1,0 +1,42 @@
+services:
+  api:
+    build:
+      context: ..
+      dockerfile: apps/api/Dockerfile
+    environment:
+      - API_PORT=4300
+      - HOST=0.0.0.0
+      - WORKER_URL=http://worker:4301
+      - SQLITE_DB_PATH=/app/data/local-sync.db
+    ports:
+      - "4300:4300"
+    volumes:
+      - ../data:/app/data
+    depends_on:
+      - worker
+
+  worker:
+    build:
+      context: ..
+      dockerfile: apps/worker/Dockerfile
+    environment:
+      - WORKER_PORT=4301
+      - HOST=0.0.0.0
+      - SQLITE_DB_PATH=/app/data/local-sync.db
+      - OLLAMA_URL=http://host.docker.internal:11434/api/generate
+      - CHROME_CDP_URL=http://host.docker.internal:9222
+    ports:
+      - "4301:4301"
+    volumes:
+      - ../data:/app/data
+
+  web:
+    build:
+      context: ..
+      dockerfile: apps/web/Dockerfile
+    environment:
+      - VITE_API_BASE_URL=http://localhost:4300
+    ports:
+      - "4173:4173"
+    depends_on:
+      - api
