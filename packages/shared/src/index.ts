@@ -53,4 +53,13 @@ export interface GmailCapturedRecord {
   snippet: string;
   bodyText: string;
   url: string;
+  images: GmailCapturedImage[];
+}
+
+export interface GmailCapturedImage {
+  kind: "inline" | "attachment";
+  filename: string;
+  mimeType: string;
+  localPath: string;
+  contentHash: string;
 }

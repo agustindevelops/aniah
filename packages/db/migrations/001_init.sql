@@ -43,3 +43,25 @@ CREATE TABLE IF NOT EXISTS ai_summaries (
   generated_at TEXT NOT NULL,
   FOREIGN KEY(normalized_record_id) REFERENCES normalized_records(id) ON DELETE CASCADE
 );
+
+CREATE TABLE IF NOT EXISTS record_images (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  raw_record_id INTEGER NOT NULL,
+  source_record_id TEXT NOT NULL,
+  image_kind TEXT NOT NULL,
+  filename TEXT NOT NULL,
+  mime_type TEXT NOT NULL,
+  local_path TEXT NOT NULL,
+  content_hash TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  FOREIGN KEY(raw_record_id) REFERENCES raw_records(id) ON DELETE CASCADE,
+  UNIQUE(raw_record_id, content_hash)
+);
+
+CREATE TABLE IF NOT EXISTS ai_image_insights (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  record_image_id INTEGER NOT NULL UNIQUE,
+  insight_json TEXT NOT NULL,
+  generated_at TEXT NOT NULL,
+  FOREIGN KEY(record_image_id) REFERENCES record_images(id) ON DELETE CASCADE
+);

@@ -93,3 +93,21 @@ Note:
 - `GET /sync/status` - last cursor/last sync metadata
 - `GET /records/recent?limit=50` - recent normalized records + AI summary joins
 - `GET /records/:id/summary` - AI summary for one normalized record
+- `GET /records/:id/images` - image metadata + image insights for one normalized record
+- `DELETE /records?confirm=1&wipeFiles=1` - clear all data for local testing (SQLite rows + `sync_sources` + optional on-disk image files)
+
+## Image Processing (Inline + Attachments)
+
+Image processing runs for Gmail records that pass the cursor check (`receivedAt > last_cursor`).
+
+- Inline images are captured from message body and stored locally.
+- Attachment thumbnails are captured and stored locally.
+- Local image files are written under `IMAGE_STORAGE_DIR`.
+- Image-level dedupe uses content hash per `raw_record_id`.
+- Ollama receives image payloads and generates image insights in addition to text summaries.
+
+Related env vars:
+
+- `IMAGE_STORAGE_DIR` (default `./data/images`)
+- `GMAIL_MAX_INLINE_IMAGES` (default `8`)
+- `GMAIL_MAX_ATTACHMENT_IMAGES` (default `8`)

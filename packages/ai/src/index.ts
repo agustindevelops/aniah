@@ -1,4 +1,5 @@
 import type { AiSummary, NormalizedRecord } from "@local-sync/shared";
+import { readFile } from "node:fs/promises";
 
 const OLLAMA_URL = process.env.OLLAMA_URL ?? "http://localhost:11434/api/generate";
 const OLLAMA_MODEL = process.env.OLLAMA_MODEL ?? "gemma3:4b";
@@ -17,7 +18,7 @@ const DEFAULT_RESULT: AiResult = {
   priority: "medium",
 };
 
-function promptForRecord(record: NormalizedRecord): string {
+function promptForRecord(record: NormalizedRecord, imageCount: number): string {
   return `
 You are an assistant for event operations triage.
 Return ONLY valid JSON with this exact shape:
@@ -44,6 +45,9 @@ ${JSON.stringify(
     null,
     2,
   )}
+
+Image context:
+${JSON.stringify({ imageCount }, null, 2)}
 `;
 }
 
@@ -71,10 +75,18 @@ function parseJsonResponse(text: string): AiResult {
   }
 }
 
-export async function generateAiSummary(normalizedRecord: NormalizedRecord): Promise<AiSummary> {
+export async function generateAiSummary(normalizedRecord: NormalizedRecord, imagePaths: string[] = []): Promise<AiSummary> {
+  const imagePayload = await Promise.all(
+    imagePaths.slice(0, 4).map(async (path) => {
+      const bytes = await readFile(path);
+      return bytes.toString("base64");
+    }),
+  ).catch(() => []);
+
   const requestBody = {
     model: OLLAMA_MODEL,
-    prompt: promptForRecord(normalizedRecord),
+    prompt: promptForRecord(normalizedRecord, imagePayload.length),
+    images: imagePayload,
     stream: false,
     options: {
       temperature: 0.1,
@@ -103,4 +115,28 @@ export async function generateAiSummary(normalizedRecord: NormalizedRecord): Pro
     priority: result.priority,
     generatedAt: new Date().toISOString(),
   };
+}
+
+export async function generateImageInsight(imagePath: string): Promise<string> {
+  const base64Image = await readFile(imagePath).then((bytes) => bytes.toString("base64"));
+  const requestBody = {
+    model: OLLAMA_MODEL,
+    prompt:
+      "Describe operationally relevant details in this email image in 1-2 concise sentences. Focus on dates, locations, names, staffing, deliveries, and missing details.",
+    images: [base64Image],
+    stream: false,
+    options: { temperature: 0.1 },
+  };
+
+  try {
+    const response = await fetch(OLLAMA_URL, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(requestBody),
+    });
+    const payload = (await response.json()) as { response?: string };
+    return (payload.response ?? "").trim() || "No image insight generated.";
+  } catch {
+    return "Image insight unavailable.";
+  }
 }

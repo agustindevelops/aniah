@@ -1,5 +1,8 @@
 import { chromium, type BrowserContext, type Page } from "playwright";
-import type { GmailCapturedRecord } from "@local-sync/shared";
+import { createHash } from "node:crypto";
+import { mkdir, writeFile } from "node:fs/promises";
+import { basename, extname, resolve } from "node:path";
+import type { GmailCapturedImage, GmailCapturedRecord } from "@local-sync/shared";
 
 interface CaptureOptions {
   cdpUrl?: string;
@@ -35,6 +38,83 @@ function buildQueryDateFromCursor(sinceIso?: string): string {
   const mm = String(date.getMonth() + 1).padStart(2, "0");
   const dd = String(date.getDate()).padStart(2, "0");
   return `${yyyy}/${mm}/${dd}`;
+}
+
+function fileSafeName(input: string): string {
+  const sanitized = input.replace(/[^\w.-]+/g, "_").slice(0, 80);
+  return sanitized.length > 0 ? sanitized : `image_${Date.now()}`;
+}
+
+function hashBuffer(input: Buffer): string {
+  return createHash("sha256").update(input).digest("hex");
+}
+
+function contentTypeToExt(contentType: string | null): string {
+  if (!contentType) return ".png";
+  if (contentType.includes("jpeg")) return ".jpg";
+  if (contentType.includes("webp")) return ".webp";
+  if (contentType.includes("gif")) return ".gif";
+  return ".png";
+}
+
+function imageStorageRoot(): string {
+  return process.env.IMAGE_STORAGE_DIR ?? resolve(process.cwd(), "data", "images");
+}
+
+async function saveImageBuffer(
+  sourceRecordId: string,
+  filenameSeed: string,
+  mimeType: string,
+  imageKind: "inline" | "attachment",
+  imageBuffer: Buffer,
+): Promise<GmailCapturedImage> {
+  const contentHash = hashBuffer(imageBuffer);
+  const ext = extname(filenameSeed) || contentTypeToExt(mimeType);
+  const finalFileName = `${fileSafeName(filenameSeed)}_${contentHash.slice(0, 8)}${ext}`;
+  const root = imageStorageRoot();
+  const targetDir = resolve(root, fileSafeName(sourceRecordId));
+  await mkdir(targetDir, { recursive: true });
+  const localPath = resolve(targetDir, finalFileName);
+  await writeFile(localPath, imageBuffer);
+
+  return {
+    kind: imageKind,
+    filename: finalFileName,
+    mimeType,
+    localPath,
+    contentHash,
+  };
+}
+
+async function captureInlineImages(page: Page, sourceRecordId: string): Promise<GmailCapturedImage[]> {
+  const maxImages = Number(process.env.GMAIL_MAX_INLINE_IMAGES ?? 8);
+  const images: GmailCapturedImage[] = [];
+  const imgNodes = page.locator("div.a3s img:visible");
+  const count = Math.min(await imgNodes.count(), maxImages);
+  for (let i = 0; i < count; i += 1) {
+    const img = imgNodes.nth(i);
+    const screenshotBuffer = await img.screenshot({ timeout: 5000 }).catch(() => null);
+    if (!screenshotBuffer) continue;
+    const src = (await img.getAttribute("src").catch(() => null)) ?? "";
+    const filename = src ? basename(src.split("?")[0]) : `inline_${i + 1}.png`;
+    images.push(await saveImageBuffer(sourceRecordId, filename, "image/png", "inline", screenshotBuffer));
+  }
+  return images;
+}
+
+async function captureAttachmentImages(page: Page, sourceRecordId: string): Promise<GmailCapturedImage[]> {
+  const maxImages = Number(process.env.GMAIL_MAX_ATTACHMENT_IMAGES ?? 8);
+  const images: GmailCapturedImage[] = [];
+  const attachmentThumbs = page.locator("div.aQH img:visible, div.aZo img:visible");
+  const count = Math.min(await attachmentThumbs.count(), maxImages);
+  for (let i = 0; i < count; i += 1) {
+    const img = attachmentThumbs.nth(i);
+    const screenshotBuffer = await img.screenshot({ timeout: 5000 }).catch(() => null);
+    if (!screenshotBuffer) continue;
+    const alt = (await img.getAttribute("alt").catch(() => null)) ?? `attachment_${i + 1}`;
+    images.push(await saveImageBuffer(sourceRecordId, alt, "image/png", "attachment", screenshotBuffer));
+  }
+  return images;
 }
 
 async function openGmailPage(context: BrowserContext): Promise<Page> {
@@ -113,6 +193,9 @@ export async function captureGmailSinceToday(options: CaptureOptions = {}): Prom
       const url = page.url();
       const threadId = url.split("/").pop() ?? `${Date.now()}-${i}`;
       const bodyText = ((await page.locator("div.a3s").first().innerText().catch(() => "")) ?? "").trim();
+      const inlineImages = await captureInlineImages(page, threadId);
+      const attachmentImages = await captureAttachmentImages(page, threadId);
+      const images = [...inlineImages, ...attachmentImages];
 
       records.push({
         source: "gmail",
@@ -124,6 +207,7 @@ export async function captureGmailSinceToday(options: CaptureOptions = {}): Prom
         snippet,
         bodyText,
         url,
+        images,
       });
 
       const backButton = page.locator('div[aria-label="Back to Inbox"]');

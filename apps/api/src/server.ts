@@ -49,6 +49,37 @@ app.get("/records/:id/summary", async (request, reply) => {
   return { ok: true, summary };
 });
 
+app.get("/records/:id/images", async (request) => {
+  const params = request.params as { id: string };
+  const normalizedId = Number(params.id);
+  const db = new Db();
+  const images = db.getImagesForNormalizedRecord(normalizedId);
+  db.close();
+  return { ok: true, images };
+});
+
+app.delete("/records", async (request, reply) => {
+  const query = request.query as { confirm?: string; wipeFiles?: string };
+  if (query.confirm !== "1") {
+    return reply.status(400).send({ ok: false, message: "Set confirm=1 to delete all data." });
+  }
+  const wipeImageFiles = query.wipeFiles === undefined || query.wipeFiles === "1" || query.wipeFiles === "true";
+  const db = new Db();
+  try {
+    const result = db.wipeAllData({ wipeImageFiles });
+    return {
+      ok: true,
+      wiped: {
+        tables: true,
+        imageDir: result.imageDir,
+        wipedImageDir: result.wipedImageDir,
+      },
+    };
+  } finally {
+    db.close();
+  }
+});
+
 app.listen({ port, host }).catch((err) => {
   console.error(err);
   process.exit(1);

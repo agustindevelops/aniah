@@ -1,12 +1,20 @@
 import Database from "better-sqlite3";
 import { createHash } from "node:crypto";
-import { mkdirSync } from "node:fs";
-import { dirname, resolve } from "node:path";
+import { existsSync, mkdirSync, rmSync } from "node:fs";
+import { dirname, isAbsolute, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { AiSummary, NormalizedRecord, RawRecord, SyncSourceState } from "@local-sync/shared";
 
 const REPO_ROOT = resolve(fileURLToPath(new URL("../../../", import.meta.url)));
 const DEFAULT_DB_PATH = process.env.SQLITE_DB_PATH ?? resolve(REPO_ROOT, "data", "local-sync.db");
+
+function resolveImageStorageDir(): string {
+  const fromEnv = process.env.IMAGE_STORAGE_DIR;
+  if (fromEnv) {
+    return isAbsolute(fromEnv) ? fromEnv : resolve(REPO_ROOT, fromEnv);
+  }
+  return resolve(REPO_ROOT, "data", "images");
+}
 
 export class Db {
   private readonly db: Database.Database;
@@ -66,8 +74,31 @@ export class Db {
         FOREIGN KEY(normalized_record_id) REFERENCES normalized_records(id) ON DELETE CASCADE
       );
 
+      CREATE TABLE IF NOT EXISTS record_images (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        raw_record_id INTEGER NOT NULL,
+        source_record_id TEXT NOT NULL,
+        image_kind TEXT NOT NULL,
+        filename TEXT NOT NULL,
+        mime_type TEXT NOT NULL,
+        local_path TEXT NOT NULL,
+        content_hash TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        FOREIGN KEY(raw_record_id) REFERENCES raw_records(id) ON DELETE CASCADE,
+        UNIQUE(raw_record_id, content_hash)
+      );
+
+      CREATE TABLE IF NOT EXISTS ai_image_insights (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        record_image_id INTEGER NOT NULL UNIQUE,
+        insight_json TEXT NOT NULL,
+        generated_at TEXT NOT NULL,
+        FOREIGN KEY(record_image_id) REFERENCES record_images(id) ON DELETE CASCADE
+      );
+
       CREATE INDEX IF NOT EXISTS idx_raw_records_source_captured_at ON raw_records(source, captured_at);
       CREATE INDEX IF NOT EXISTS idx_normalized_records_updated_at ON normalized_records(updated_at);
+      CREATE INDEX IF NOT EXISTS idx_record_images_raw_record_id ON record_images(raw_record_id);
     `);
   }
 
@@ -153,6 +184,53 @@ export class Db {
       });
   }
 
+  insertRecordImage(image: {
+    rawRecordId: number;
+    sourceRecordId: string;
+    imageKind: "inline" | "attachment";
+    filename: string;
+    mimeType: string;
+    localPath: string;
+    contentHash: string;
+    createdAt: string;
+  }): number | null {
+    const result = this.db
+      .prepare(
+        `
+      INSERT OR IGNORE INTO record_images(
+        raw_record_id, source_record_id, image_kind, filename, mime_type, local_path, content_hash, created_at
+      )
+      VALUES(
+        @rawRecordId, @sourceRecordId, @imageKind, @filename, @mimeType, @localPath, @contentHash, @createdAt
+      )
+    `,
+      )
+      .run(image);
+
+    if (result.changes === 0) {
+      const existing = this.db
+        .prepare("SELECT id FROM record_images WHERE raw_record_id = ? AND content_hash = ?")
+        .get(image.rawRecordId, image.contentHash) as { id: number } | undefined;
+      return existing?.id ?? null;
+    }
+
+    return Number(result.lastInsertRowid);
+  }
+
+  upsertAiImageInsight(input: { recordImageId: number; insightJson: string; generatedAt: string }): void {
+    this.db
+      .prepare(
+        `
+      INSERT INTO ai_image_insights(record_image_id, insight_json, generated_at)
+      VALUES(@recordImageId, @insightJson, @generatedAt)
+      ON CONFLICT(record_image_id) DO UPDATE SET
+        insight_json = excluded.insight_json,
+        generated_at = excluded.generated_at
+    `,
+      )
+      .run(input);
+  }
+
   getRecentRecords(limit = 100): Array<Record<string, unknown>> {
     return this.db
       .prepare(
@@ -171,9 +249,20 @@ export class Db {
         ai.summary,
         ai.missing_fields as missingFields,
         ai.priority,
-        ai.category
+        ai.category,
+        COALESCE(img.imageCount, 0) as imageCount,
+        img.imageInsights
       FROM normalized_records nr
       LEFT JOIN ai_summaries ai ON ai.normalized_record_id = nr.id
+      LEFT JOIN (
+        SELECT
+          ri.raw_record_id,
+          COUNT(*) as imageCount,
+          GROUP_CONCAT(aii.insight_json, ' || ') as imageInsights
+        FROM record_images ri
+        LEFT JOIN ai_image_insights aii ON aii.record_image_id = ri.id
+        GROUP BY ri.raw_record_id
+      ) img ON img.raw_record_id = nr.raw_record_id
       ORDER BY nr.updated_at DESC
       LIMIT ?
     `,
@@ -188,6 +277,60 @@ export class Db {
       )
       .get(normalizedRecordId) as Record<string, unknown> | undefined;
     return row ?? null;
+  }
+
+  getImagesForNormalizedRecord(normalizedRecordId: number): Array<Record<string, unknown>> {
+    return this.db
+      .prepare(
+        `
+      SELECT
+        ri.id,
+        ri.raw_record_id as rawRecordId,
+        ri.source_record_id as sourceRecordId,
+        ri.image_kind as imageKind,
+        ri.filename,
+        ri.mime_type as mimeType,
+        ri.local_path as localPath,
+        ri.content_hash as contentHash,
+        ri.created_at as createdAt,
+        aii.insight_json as insightJson,
+        aii.generated_at as insightGeneratedAt
+      FROM normalized_records nr
+      JOIN record_images ri ON ri.raw_record_id = nr.raw_record_id
+      LEFT JOIN ai_image_insights aii ON aii.record_image_id = ri.id
+      WHERE nr.id = ?
+      ORDER BY ri.id DESC
+    `,
+      )
+      .all(normalizedRecordId) as Array<Record<string, unknown>>;
+  }
+
+  /**
+   * Deletes all app data for local testing. Optionally removes local image files.
+   * Does not remove the SQLite file itself (tables are emptied).
+   */
+  wipeAllData(options: { wipeImageFiles: boolean }): { imageDir: string; wipedImageDir: boolean } {
+    const imageDir = resolveImageStorageDir();
+    this.db.exec("BEGIN");
+    this.db.exec("DELETE FROM ai_image_insights");
+    this.db.exec("DELETE FROM record_images");
+    this.db.exec("DELETE FROM ai_summaries");
+    this.db.exec("DELETE FROM normalized_records");
+    this.db.exec("DELETE FROM raw_records");
+    this.db.exec("DELETE FROM sync_sources");
+    this.db.exec("COMMIT");
+    this.db.exec("VACUUM");
+
+    let wipedImageDir = false;
+    if (options.wipeImageFiles) {
+      if (existsSync(imageDir)) {
+        rmSync(imageDir, { recursive: true, force: true });
+        mkdirSync(imageDir, { recursive: true });
+        wipedImageDir = true;
+      }
+    }
+
+    return { imageDir, wipedImageDir };
   }
 
   hashText(input: string): string {

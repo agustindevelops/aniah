@@ -1,13 +1,14 @@
 import { Db } from "@local-sync/db";
 import { normalizeGmailRecord } from "@local-sync/pipeline";
 import { captureGmailSinceToday } from "@local-sync/scraper";
-import { generateAiSummary } from "@local-sync/ai";
+import { generateAiSummary, generateImageInsight } from "@local-sync/ai";
 
 export interface SyncResult {
   captured: number;
   insertedRaw: number;
   normalized: number;
   aiSummaries: number;
+  insertedImages: number;
   previousCursor: string;
   runStartedAt: string;
   runCompletedAt: string;
@@ -40,6 +41,7 @@ export async function runGmailSync(): Promise<SyncResult> {
   let insertedRaw = 0;
   let normalized = 0;
   let aiSummaries = 0;
+  let insertedImages = 0;
   let nextCursor = previousCursor;
 
   try {
@@ -66,11 +68,34 @@ export async function runGmailSync(): Promise<SyncResult> {
       }
 
       insertedRaw += 1;
+      const imagePaths: string[] = [];
+      for (const image of record.images) {
+        const recordImageId = db.insertRecordImage({
+          rawRecordId,
+          sourceRecordId: record.sourceRecordId,
+          imageKind: image.kind,
+          filename: image.filename,
+          mimeType: image.mimeType,
+          localPath: image.localPath,
+          contentHash: image.contentHash,
+          createdAt: new Date().toISOString(),
+        });
+        if (!recordImageId) continue;
+        insertedImages += 1;
+        imagePaths.push(image.localPath);
+        const insight = await generateImageInsight(image.localPath);
+        db.upsertAiImageInsight({
+          recordImageId,
+          insightJson: JSON.stringify({ insight }),
+          generatedAt: new Date().toISOString(),
+        });
+      }
+
       const normalizedRecord = normalizeGmailRecord(rawRecordId, record);
       const normalizedId = db.insertNormalizedRecord(normalizedRecord);
       normalized += 1;
 
-      const aiSummary = await generateAiSummary({ ...normalizedRecord, id: normalizedId });
+      const aiSummary = await generateAiSummary({ ...normalizedRecord, id: normalizedId }, imagePaths);
       db.insertAiSummary({ ...aiSummary, normalizedRecordId: normalizedId });
       aiSummaries += 1;
     }
@@ -88,6 +113,7 @@ export async function runGmailSync(): Promise<SyncResult> {
       insertedRaw,
       normalized,
       aiSummaries,
+      insertedImages,
       previousCursor,
       runStartedAt,
       runCompletedAt,
